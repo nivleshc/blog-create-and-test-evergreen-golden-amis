@@ -1,0 +1,10 @@
+name: test_golden_ami
+title: Chef Inspec Profile to test Golden AMI
+maintainer: Nivlesh Chandra
+copyright: Nivlesh Chandra
+copyright_email: Nivlesh Chandra
+license: Apache-2.0
+summary: A Chef Inspec Profile for testing that all customisations to the Golden AMI have been done successfully.
+version: 0.1.0
+supports:
+  platform: os

@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  FilenameSuffix:
+    Type: String
+    Description: Suffix used for report filename
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Enter Instance size. Default is t3.micro
+  AmiId:
+    Type: String
+    Description: The ami id of the Amazon Machine Image to use
+  IamInstanceProfile:
+    Type: String
+    Description: The IAM Instance Profile to use with this EC2 instance
+  SubnetId:
+    Type: String
+    Description: Subnet Id for where to create the EC2 instance
+  VPCSecurityGroupIds:
+    Type: String
+    Description: Ids of VPC Security Groups to attach to the EC2 instance
+  ReportS3Bucket:
+    Type: String
+    Description: Amazon S3 bucket to use to store the test reports. Reports will be stored in S3Bucket/tests folder(key)
+Resources:
+  GoldenAMITestEC2:
+    Type: 'AWS::EC2::Instance'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref IamInstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCSecurityGroupIds
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -ev
+
+            function catch_error() {
+              error_code=$?
+              echo catch_error:error_code:${!error_code}
+
+              # check if the error code is from Chef Inspec due to a test failing or being skipped
+              # https://docs.chef.io/inspec/cli/
+              if [ $error_code = 100 ] || [ $error_code = 101 ]
+              then
+                # this error is because at least one Chef Inspec test failed or was skipped
+
+                filename=${FilenameSuffix}_checks_failed.html
+                local_path=/tmp/${!filename}
+                report_s3_location=s3://${ReportS3Bucket}/tests/${!filename}
+                
+                # upload the Chef Inspec report to S3 bucket
+                aws s3 cp ${!local_path} ${!report_s3_location}
+                
+                /opt/aws/bin/cfn-signal -e ${!error_code} --stack ${AWS::StackName} --resource GoldenAMITestEC2 --region ${AWS::Region}
+              else
+                # this is a genuine error. Upload the /var/log/cloud-init-output.log to S3 bucket for troubleshooting
+
+                filename=${FilenameSuffix}_error.log
+                local_path=/var/log/cloud-init-output.log
+                report_s3_location=s3://${ReportS3Bucket}/tests/${!filename}
+
+                # upload cloud-init-output log to S3 bucket
+                aws s3 cp ${!local_path} ${!report_s3_location}
+
+                /opt/aws/bin/cfn-signal -e ${!error_code} --stack ${AWS::StackName} --resource GoldenAMITestEC2 --region ${AWS::Region}
+              fi
+            }
+
+            trap 'catch_error' ERR
+
+            # ensure that Amazon Systems Manager agent is running. Amazon SSM Session Manager will be used to connect to this instance, if need be
+            systemctl start amazon-ssm-agent
+            systemctl enable amazon-ssm-agent
+
+            # fix issue with missing cfnbootstrap module when running cfn-signal
+            curl https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.zip -o /tmp/aws-cfn-bootstrap.zip
+            unzip /tmp/aws-cfn-bootstrap.zip -d /tmp
+            mv /tmp/aws-cfn-bootstrap-2.0/cfnbootstrap/ /opt/aws/apitools/cfn-init/bin/
+
+            # accept the Chef Inspec license
+            /opt/inspec/bin/inspec --chef-license=accept
+
+            filename=${FilenameSuffix}_checks_passed.html
+            local_path=/tmp/${!filename}
+            report_s3_location=s3://${ReportS3Bucket}/tests/${!filename}
+
+            /opt/inspec/bin/inspec exec /tests/test_golden_ami --reporter html2:${!local_path}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource GoldenAMITestEC2 --region ${AWS::Region}
+
+            # upload the Chef Inspec report to S3 bucket
+            aws s3 cp ${!local_path} ${!report_s3_location}
+      Tags:
+        -
+          Key: Name
+          Value: golden-ami-test-ec2
+
+            

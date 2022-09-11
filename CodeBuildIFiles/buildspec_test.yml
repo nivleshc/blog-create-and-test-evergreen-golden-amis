@@ -1,0 +1,126 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+    - echo "Test Pipeline:Phase:pre_build"
+  build:
+    commands:
+    - echo "Test Pipeline:Phase:build"
+    - time_now=$(date +%Y%m%dT%H%M%S)
+    - FILENAME_SUFFIX=$time_now-$GOLDEN_AMI_ID
+    - echo ">creating cloudformation stack to provision an ec2 instance using supplied GOLDEN_AMI_ID=${GOLDEN_AMI_ID}"
+    - echo aws cloudformation create-stack --stack-name $TEST_CFN_STACK_NAME --template-body file://cfn/cfn-test-golden-ami.yaml --parameters ParameterKey=FilenameSuffix,ParameterValue=$FILENAME_SUFFIX ParameterKey=AmiId,ParameterValue=$GOLDEN_AMI_ID ParameterKey=IamInstanceProfile,ParameterValue=$TEST_EC2_INSTANCE_PROFILE ParameterKey=SubnetId,ParameterValue=$SUBNET_ID ParameterKey=VPCSecurityGroupIds,ParameterValue=$SECURITY_GROUP_ID ParameterKey=ReportS3Bucket,ParameterValue=$TEST_REPORT_S3_BUCKET --region=$AWS_REGION
+    - aws cloudformation create-stack --stack-name $TEST_CFN_STACK_NAME --template-body file://cfn/cfn-test-golden-ami.yaml --parameters ParameterKey=FilenameSuffix,ParameterValue=$FILENAME_SUFFIX ParameterKey=AmiId,ParameterValue=$GOLDEN_AMI_ID ParameterKey=IamInstanceProfile,ParameterValue=$TEST_EC2_INSTANCE_PROFILE ParameterKey=SubnetId,ParameterValue=$SUBNET_ID ParameterKey=VPCSecurityGroupIds,ParameterValue=$SECURITY_GROUP_ID ParameterKey=ReportS3Bucket,ParameterValue=$TEST_REPORT_S3_BUCKET --region=$AWS_REGION
+    - |
+      function check_stack_status() {
+          stack_status=$(aws cloudformation describe-stacks --stack-name $TEST_CFN_STACK_NAME --region=$AWS_REGION --query 'Stacks'[*].['StackStatus'] --output text)
+          case "$stack_status" in
+
+              "CREATE_COMPLETE")
+                  stack_creation_finished=true
+                  ;;
+
+              "ROLLBACK_COMPLETE")
+                  stack_creation_finished=true
+                  ;;
+
+              "ROLLBACK_FAILED")
+                  stack_creation_finished=true
+                  ;;
+
+              *)
+              stack_creation_finished=false
+              ;;
+          esac
+      }
+
+      # wait for the CloudFormation stack to finish deployment - either it will be successful or it will fail
+      check_stack_status
+
+      while [[ "$stack_creation_finished" == false ]]
+      do
+          echo "`date` stack_status=$stack_status  stack_creation_finished=$stack_creation_finished"
+          sleep 10
+          check_stack_status
+      done
+      
+      echo "`date` stack_status=$stack_status  stack_creation_finished=$stack_creation_finished"
+      
+      # lets check if the Chef Inspec reports have been uploaded successfully
+      # the uploaded reports file will have one of three names, lets check each one
+
+      # we will fail the pipeline if the Chef Inpsec checks had failed or if there was any other errors while testing
+      exit_code=0
+      VALIDATION_RESULT=""
+      VALIDATION_MSG=""
+
+      # check if a file with a name that matches a successful Chef Inspec check reports filename exists in Reports S3 bucket
+      REPORT_FILENAME=${FILENAME_SUFFIX}_checks_passed.html
+      REPORT_FILE_S3_URL="https://s3.console.aws.amazon.com/s3/object/${TEST_REPORT_S3_BUCKET}?region=${AWS_REGION}&prefix=tests/${REPORT_FILENAME}"
+      REPORT_CHECK_STATUS=`aws s3api head-object --bucket $TEST_REPORT_S3_BUCKET --key tests/$REPORT_FILENAME`
+        
+      if [[ $REPORT_CHECK_STATUS != "" ]];
+      then
+        VALIDATION_MSG="All Chef Inspec checks for Golden AMI [${GOLDEN_AMI_ID}] were successful. Report is available at ${REPORT_FILE_S3_URL}"
+        VALIDATION_RESULT="Pass"
+      else
+        # No filename matching a successful Chef Inspec check was found. Next, check for a filename that matches a failed Chef Inspec check.
+        REPORT_FILENAME=${FILENAME_SUFFIX}_checks_failed.html
+        REPORT_FILE_S3_URL="https://s3.console.aws.amazon.com/s3/object/${TEST_REPORT_S3_BUCKET}?region=${AWS_REGION}&prefix=tests/${REPORT_FILENAME}"
+        REPORT_CHECK_STATUS=`aws s3api head-object --bucket $TEST_REPORT_S3_BUCKET --key tests/$REPORT_FILENAME`
+
+        if [[ $REPORT_CHECK_STATUS != "" ]];
+        then
+          VALIDATION_MSG="Some or all Chef Inspec checks for Golden AMI [${GOLDEN_AMI_ID}] either failed or were skipped. Report is available at ${REPORT_FILE_S3_URL}"
+          exit_code=1
+          VALIDATION_RESULT="Fail"
+        else
+          # if no Chef Inspec test pass or fail reports were found, then there could have been an some other error. Check for that file.
+          REPORT_FILENAME=${FILENAME_SUFFIX}_error.html
+          REPORT_FILE_S3_URL="https://s3.console.aws.amazon.com/s3/object/${TEST_REPORT_S3_BUCKET}?region=${AWS_REGION}&prefix=tests/${REPORT_FILENAME}"
+          REPORT_CHECK_STATUS=`aws s3api head-object --bucket $TEST_REPORT_S3_BUCKET --key tests/$REPORT_FILENAME`
+
+          if [[ $file_check_status != "" ]];
+          then
+            VALIDATION_MSG="There was an error testing the Golden AMI [${GOLDEN_AMI_ID}]. Logs for troubleshooting are available at ${REPORT_FILE_S3_URL}"
+          else
+            VALIDATION_MSG="An unknown error occurred while testing the Golden AMI [${GOLDEN_AMI_ID}]. No Chef Inspec reports or error logs were found in Amazon S3 bucket [${TEST_REPORT_S3_BUCKET}]. Please Investigate!"
+          fi
+          exit_code=1
+          VALIDATION_RESULT="Error"
+        fi
+      fi
+
+      echo -e "\n${VALIDATION_MSG}"
+
+      echo ""
+      echo "Testing has finished. Starting cleanup"
+      echo "CloudFormation Stack used for testing the golden ami [$TEST_CFN_STACK_NAME] will now be deleted"
+      echo "aws cloudformation delete-stack --stack-name $TEST_CFN_STACK_NAME --region=$AWS_REGION"
+      aws cloudformation delete-stack --stack-name $TEST_CFN_STACK_NAME --region=$AWS_REGION
+
+      stack_status=$(aws cloudformation describe-stacks --stack-name $TEST_CFN_STACK_NAME --region=$AWS_REGION --query 'Stacks'[*].['StackStatus'] --output text)
+
+      while [[ "$stack_status" != "" ]];
+      do
+        echo `date` stack_status=$stack_status
+        sleep 10
+        stack_status=$(aws cloudformation describe-stacks --stack-name $TEST_CFN_STACK_NAME --region=$AWS_REGION --query 'Stacks'[*].['StackStatus'] --output text)
+      done
+
+      echo ""
+      echo "`date` CloudFormation stack used for testing the golden ami [$TEST_CFN_STACK_NAME] has been successfully deleted"
+
+      echo "Adding validation tags to golden ami"
+      VALIDATION_TIME="$(date "+%Y-%m-%d %H:%M:%S") UTC"
+      aws ec2 create-tags --resources $GOLDEN_AMI_ID --tags Key=ValidationResult,Value="$VALIDATION_RESULT" Key=ValidationTime,Value="$VALIDATION_TIME"
+
+      echo ""
+      echo "Sending message with validation results to Amazon SNS Topic"
+      aws sns publish --topic-arn $SNS_TOPIC_ARN --message "${VALIDATION_MSG}"
+
+      exit $exit_code
+  post_build:
+    commands:
+    - echo "Test Pipeline:Phase:post_build"
